@@ -6,9 +6,7 @@ namespace ASPNETCore2JwtAuthentication.DomainClasses
     {
         public int Id { get; set; }
 
-        public string AccessTokenHash { get; set; }
-
-        public DateTimeOffset AccessTokenExpiresDateTime { get; set; }
+        public string RefreshTokenSerial { get; set; }
 
         public string RefreshTokenIdHash { get; set; }
 

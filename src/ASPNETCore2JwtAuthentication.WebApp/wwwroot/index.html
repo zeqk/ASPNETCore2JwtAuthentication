@@ -29,7 +29,8 @@
         <button type="button" class="btn btn-warning" onclick="doLogin('/api/account/RefreshToken',{
                 refreshToken: refreshToken})" id="login">Refresh Token</button>
 
-        <button type="button" class="btn btn-danger" onclick="doCallApi('/api/account/logout')"
+        <button type="button" class="btn btn-danger" onclick="doLogout('/api/account/logout',{
+                refreshToken: refreshToken})"
             name="logout">Logout</button>
 
         <div class="alert alert-warning" style="margin-top: 15px">
@@ -62,6 +63,23 @@
                     jwtToken = "";
                     refreshToken = "";
                 }
+            });
+        }
+
+        function doLogout(url, data) {
+            $.ajax({
+                url: url,
+                data: JSON.stringify(data),
+                type: 'POST',
+                dataType: 'json',
+                contentType: 'application/json; charset=utf-8'
+            }).then(function (response) {
+                console.log("response", response);
+                if (response) {
+                    alert(JSON.stringify(response, null, ' '));
+            }, function (xhr, status, error) {
+                console.log({ xhr: xhr, status: status, error: error });
+                alert('Logout failed');
             });
         }
 

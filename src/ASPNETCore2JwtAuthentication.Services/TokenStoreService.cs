@@ -18,14 +18,14 @@ namespace ASPNETCore2JwtAuthentication.Services
     {
         Task AddUserTokenAsync(UserToken userToken);
         Task AddUserTokenAsync(
-                User user, string refreshToken, string accessToken,
-                DateTimeOffset refreshTokenExpiresDateTime, DateTimeOffset accessTokenExpiresDateTime);
+                User user, string refreshToken,
+                DateTimeOffset refreshTokenExpiresDateTime, string refreshTokenSerial);
         Task<bool> IsValidTokenAsync(string accessToken, int userId);
         Task DeleteExpiredTokensAsync();
         Task<UserToken> FindTokenAsync(string refreshToken);
-        Task DeleteTokenAsync(string refreshToken);
         Task InvalidateUserTokensAsync(int userId);
-        Task<(string accessToken, string refreshToken)> CreateJwtTokens(User user);
+        Task<(string accessToken, string newRefreshToken)> CreateJwtTokens(User user, string refreshTokenSerial);
+        Task InvalidateUserTokensWithSameSerialAsync(string refreshTokenSerial);
     }
 
     public class TokenStoreService : ITokenStoreService
@@ -59,25 +59,24 @@ namespace ASPNETCore2JwtAuthentication.Services
 
         public async Task AddUserTokenAsync(UserToken userToken)
         {
-            if (!_configuration.Value.AllowMultipleLoginsFromTheSameUser)
-            {
-                await InvalidateUserTokensAsync(userToken.UserId);
-            }
+
+            await deleteTokensBySerialAsync(userToken.RefreshTokenSerial);
+            
             _tokens.Add(userToken);
         }
 
         public async Task AddUserTokenAsync(
-                User user, string refreshToken, string accessToken,
-                DateTimeOffset refreshTokenExpiresDateTime, DateTimeOffset accessTokenExpiresDateTime)
+                User user, string refreshToken,
+                DateTimeOffset refreshTokenExpiresDateTime, 
+                string refreshTokenSerial)
         {
             var token = new UserToken
             {
                 UserId = user.Id,
                 // Refresh token handles should be treated as secrets and should be stored hashed
                 RefreshTokenIdHash = _securityService.GetSha256Hash(refreshToken),
-                AccessTokenHash = _securityService.GetSha256Hash(accessToken),
                 RefreshTokenExpiresDateTime = refreshTokenExpiresDateTime,
-                AccessTokenExpiresDateTime = accessTokenExpiresDateTime
+                RefreshTokenSerial = refreshTokenSerial
             };
             await AddUserTokenAsync(token);
         }
@@ -92,14 +91,25 @@ namespace ASPNETCore2JwtAuthentication.Services
             }
         }
 
-        public async Task DeleteTokenAsync(string refreshToken)
+        public async Task InvalidateUserTokensWithSameSerialAsync(string refreshTokenSerial)
         {
-            var token = await FindTokenAsync(refreshToken);
-            if (token != null)
+            var tokenSerial = getTokenSerial(refreshTokenSerial);
+            if(!string.IsNullOrEmpty(tokenSerial))
             {
-                _tokens.Remove(token);
+                await deleteTokensBySerialAsync(tokenSerial);
             }
         }
+
+
+        private async Task deleteTokensBySerialAsync(string refreshTokenSerial)
+        {
+            await _tokens.Where(t => t.RefreshTokenSerial == refreshTokenSerial).ForEachAsync(item =>
+             {
+                 _tokens.Remove(item);
+             });
+        }
+        
+        
 
         public Task<UserToken> FindTokenAsync(string refreshToken)
         {
@@ -122,27 +132,37 @@ namespace ASPNETCore2JwtAuthentication.Services
 
         public async Task<bool> IsValidTokenAsync(string accessToken, int userId)
         {
+            var tokenSerial = getTokenSerial(accessToken);
+
             var accessTokenHash = _securityService.GetSha256Hash(accessToken);
-            var userToken = await _tokens.FirstOrDefaultAsync(
-                x => x.AccessTokenHash == accessTokenHash && x.UserId == userId);
-            return userToken?.AccessTokenExpiresDateTime >= DateTime.UtcNow;
+            var rv = await _tokens.AnyAsync(
+                x => x.RefreshTokenSerial == tokenSerial);
+            return rv;
         }
 
-        public async Task<(string accessToken, string refreshToken)> CreateJwtTokens(User user)
+        public async Task<(string accessToken, string newRefreshToken)> CreateJwtTokens(User user, string refreshTokenSerial)
         {
             var now = DateTimeOffset.UtcNow;
             var accessTokenExpiresDateTime = now.AddMinutes(_configuration.Value.AccessTokenExpirationMinutes);
             var refreshTokenExpiresDateTime = now.AddMinutes(_configuration.Value.RefreshTokenExpirationMinutes);
-            var accessToken = await createAccessTokenAsync(user, accessTokenExpiresDateTime.UtcDateTime);
-            var refreshToken = Guid.NewGuid().ToString().Replace("-", "");
+            var accessToken = await createAccessTokenAsync(user, accessTokenExpiresDateTime.UtcDateTime, refreshTokenSerial);
+            var newRefreshToken = await createRefreshTokenAsync(refreshTokenSerial, refreshTokenExpiresDateTime.UtcDateTime);
 
-            await AddUserTokenAsync(user, refreshToken, accessToken, refreshTokenExpiresDateTime, accessTokenExpiresDateTime);
+            await AddUserTokenAsync(user, newRefreshToken, refreshTokenExpiresDateTime, refreshTokenSerial);
             await _uow.SaveChangesAsync();
 
-            return (accessToken, refreshToken);
+            return (accessToken, newRefreshToken);
         }
 
-        private async Task<string> createAccessTokenAsync(User user, DateTime expires)
+        private string getTokenSerial(string token)
+        {
+            var decodedToken = new JwtSecurityTokenHandler().ReadJwtToken(token);
+            var tokenSerialClaim = decodedToken.Claims.FirstOrDefault(c => c.Type == "TokenSerial");
+                        
+            return tokenSerialClaim?.Value;
+        }
+
+        private async Task<string> createAccessTokenAsync(User user, DateTime expires, string refreshTokenSerial)
         {
             var claims = new List<Claim>
             {
@@ -158,21 +178,47 @@ namespace ASPNETCore2JwtAuthentication.Services
                 // to invalidate the cookie
                 new Claim(ClaimTypes.SerialNumber, user.SerialNumber),
                 // custom data
-                new Claim(ClaimTypes.UserData, user.Id.ToString())
+                new Claim(ClaimTypes.UserData, user.Id.ToString()),
+                //refresh token serial
+                new Claim("TokenSerial",refreshTokenSerial)
             };
-
+            
             // add roles
             var roles = await _rolesService.FindUserRolesAsync(user.Id);
             foreach (var role in roles)
             {
                 claims.Add(new Claim(ClaimTypes.Role, role.Name));
             }
-
+            
             var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration.Value.Key));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
             var token = new JwtSecurityToken(
                 issuer: _configuration.Value.Issuer,
                 audience: _configuration.Value.Audience,
+                claims: claims,
+                notBefore: DateTime.UtcNow,
+                expires: expires,
+                signingCredentials: creds);
+            
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+        private async Task<string> createRefreshTokenAsync(string refreshTokenSerial, DateTime expires)
+        {
+            var claims = new List<Claim>
+            {
+                // Unique Id for all Jwt tokes
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                // Issued at
+                new Claim(JwtRegisteredClaimNames.Iat, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(), ClaimValueTypes.Integer64),                                
+                // to invalidate the cookie
+                new Claim("TokenSerial",refreshTokenSerial)
+            };
+            
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration.Value.Key));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+            var token = new JwtSecurityToken(
                 claims: claims,
                 notBefore: DateTime.UtcNow,
                 expires: expires,

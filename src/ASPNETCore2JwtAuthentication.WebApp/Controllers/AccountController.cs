@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Cors;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json.Linq;
+using System;
 
 namespace ASPNETCore2JwtAuthentication.WebApp.Controllers
 {
@@ -55,7 +56,7 @@ namespace ASPNETCore2JwtAuthentication.WebApp.Controllers
                 return Unauthorized();
             }
 
-            var (accessToken, refreshToken) = await _tokenStoreService.CreateJwtTokens(user);
+            var (accessToken, refreshToken) = await _tokenStoreService.CreateJwtTokens(user, Guid.NewGuid().ToString());
             return Ok(new { access_token = accessToken, refresh_token = refreshToken });
         }
 
@@ -72,28 +73,25 @@ namespace ASPNETCore2JwtAuthentication.WebApp.Controllers
             var token = await _tokenStoreService.FindTokenAsync(refreshToken);
             if (token == null)
             {
+                await _tokenStoreService.InvalidateUserTokensWithSameSerialAsync(refreshToken);
                 return Unauthorized();
             }
 
-            var (accessToken, newRefreshToken) = await _tokenStoreService.CreateJwtTokens(token.User);
+            var (accessToken, newRefreshToken) = await _tokenStoreService.CreateJwtTokens(token.User, token.RefreshTokenSerial);
             return Ok(new { access_token = accessToken, refresh_token = newRefreshToken });
         }
 
         [AllowAnonymous]
         [HttpGet("[action]"), HttpPost("[action]")]
-        public async Task<bool> Logout()
+        public async Task<bool> Logout([FromBody]JToken jsonBody)
         {
-            var claimsIdentity = this.User.Identity as ClaimsIdentity;
-            var userIdValue = claimsIdentity.FindFirst(ClaimTypes.UserData)?.Value;
+            var refreshToken = jsonBody.Value<string>("refreshToken");
 
             // The Jwt implementation does not support "revoke OAuth token" (logout) by design.
             // Delete the user's tokens from the database (revoke its bearer token)
-            if (!string.IsNullOrWhiteSpace(userIdValue) && int.TryParse(userIdValue, out int userId))
+            if (!string.IsNullOrWhiteSpace(refreshToken))
             {
-                if (_configuration.Value.AllowSignoutAllUserActiveClients)
-                {
-                    await _tokenStoreService.InvalidateUserTokensAsync(userId);
-                }
+                await _tokenStoreService.InvalidateUserTokensWithSameSerialAsync(refreshToken);
             }
             await _tokenStoreService.DeleteExpiredTokensAsync();
             await _uow.SaveChangesAsync();
